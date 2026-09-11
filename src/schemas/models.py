@@ -1,19 +1,24 @@
 from decimal import Decimal
+from datetime import datetime
 from typing import Self
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class TokenUsage(BaseModel):
     """Input includes cached tokens; output includes reasoning tokens."""
 
-    input_tokens: int = Field(ge=0, strict=True)
-    output_tokens: int = Field(ge=0, strict=True)
+    model_config = ConfigDict(extra="forbid")
+
+    input_tokens: int = Field(ge=0, le=9223372036854775807, strict=True)
+    output_tokens: int = Field(ge=0, le=9223372036854775807, strict=True)
     cached_input_tokens: int = Field(default=0, ge=0, strict=True)
     reasoning_tokens: int = Field(default=0, ge=0, strict=True)
 
     @model_validator(mode="after")
     def validate_token_breakdown(self) -> Self:
+        if self.input_tokens + self.output_tokens > 9223372036854775807:
+            raise ValueError("Total tokens exceed the supported integer range")
         if self.cached_input_tokens > self.input_tokens:
             raise ValueError("cached_input_tokens cannot exceed input_tokens")
         if self.reasoning_tokens > self.output_tokens:
@@ -24,7 +29,9 @@ class TokenUsage(BaseModel):
 class GenerateRequest(BaseModel):
     """Prompt and simulated usage for the dummy generation endpoint."""
 
-    prompt: str = Field(min_length=1)
+    model_config = ConfigDict(extra="forbid")
+
+    prompt: str = Field(min_length=1, max_length=100000)
     usage: TokenUsage
 
 
@@ -34,6 +41,18 @@ class GenerateResponse(BaseModel):
     text: str
     usage: TokenUsage
     cost: Decimal = Field(ge=0, allow_inf_nan=False)
+
+
+class UsageResponse(BaseModel):
+    period_start: datetime
+    period_end: datetime
+    plan: str
+    subscription_status: str
+    api_calls_used: int
+    api_call_limit: int
+    tokens_used: int
+    token_limit: int
+    costs_by_currency: dict[str, Decimal]
     
 
 class APIRequest(BaseModel):

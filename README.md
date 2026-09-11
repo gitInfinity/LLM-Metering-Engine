@@ -1,21 +1,21 @@
 # LLM Usage Metering & Billing Engine
 
-A backend capstone project that tracks API calls and AI token usage per tenant, calculates per-request and monthly costs, enforces quotas, and supports subscription upgrades through Stripe test mode.
+A backend capstone project that tracks API calls and AI token usage per tenant, calculates per-request and 30-day costs, enforces quotas, and supports subscription upgrades through Stripe test mode.
 
-**Status:** API models, SQLAlchemy table definitions, and PostgreSQL connection boilerplate are in place. Billing features below are planned and will be built in four phases, each ending with a commit.
+**Status:** PostgreSQL setup, metering, bearer API-key authentication, and generation/usage HTTP routes are implemented. Stripe integration and final pricing decisions remain pending.
 
 ## Scope
 
-- Customers belong to tenants. Each tenant has its own subscription, quotas, and isolated usage records.
+- Users belong to tenants (customer organizations). Each tenant has its own subscription, quotas, and isolated usage records. Stripe's customer reference represents the tenant.
 - One dummy billable endpoint simulates AI usage; no model call or AI API key is required.
 - Each accepted request records usage exactly once. Retrying with the same idempotency key returns the original result without another charge.
 - Requests are checked against quotas before being allowed. Blocked requests explain the reason: `429` for quota exhaustion or `402` when payment or an upgrade is required.
-- Usage reporting shows monthly usage, plan limits, and calculated costs.
+- Usage reporting shows 30-day usage, plan limits, and calculated costs.
 - Stripe Checkout and verified webhooks manage Free-to-Pro upgrades and subscription status.
 
 ## Plans
 
-| Plan | API calls / month | AI tokens / month |
+| Plan | API calls / 30 days | AI tokens / 30 days |
 | --- | ---: | ---: |
 | Free | 1,000 | 100,000 |
 | Pro | 10,000 | 1,000,000 |
@@ -29,7 +29,7 @@ Client -> Billable endpoint -> Tenant + idempotency check
                            -> Quota check -> Reject with 429 / 402
                            -> Record usage once + calculate cost
 
-Client -> Usage endpoint -> Tenant's monthly usage, limits, and cost
+Client -> Usage endpoint -> Tenant's 30-day usage, limits, and cost
 
 Client -> Stripe Checkout (test mode)
 Stripe -> Signed webhook -> Verify + deduplicate -> Sync subscription
@@ -41,7 +41,7 @@ The database will contain tenants, plans, subscriptions, and usage events. Strip
 
 | Phase / commit | Work | Completion gate |
 | --- | --- | --- |
-| 1. Design | Define schema, plans, API contract, and idempotency strategy. | Commit a one-page design document. |
+| 1. Design | Define schema, plans, API contract, and idempotency strategy. | Design captured in [DESIGN.md](DESIGN.md); completion requires committing it. |
 | 2. Core billing logic | Implement usage metering, duplicate prevention, and quota enforcement. | Sending the same request twice creates one event; quota boundaries return the appropriate `429` / `402`. |
 | 3. Stripe integration | Add test Checkout, signature verification, webhook deduplication, and subscription sync. | Test Checkout upgrades a tenant from Free to Pro through a verified webhook. |
 | 4. Cost & finalization | Add cost rollups, verify token pricing, and finish documentation and evidence. | Usage totals match pinned pricing; every requirement has proof. |
@@ -56,11 +56,12 @@ uv sync
 . .\.venv\Scripts\Activate.ps1
 docker compose up -d --wait db
 uv run --env-file .env -m src.db.database
+uv run --env-file .env -m src.db.seed
 ```
 
-The final command runs `SELECT 1` and prints `PostgreSQL connection successful.` on success. The app reads `DATABASE_URL`; Compose reads `POSTGRES_DB`, `POSTGRES_USER`, and `POSTGRES_PASSWORD`. Keep these values consistent. The example credentials are for local development. If using an existing PostgreSQL server, set its connection URL and skip the Docker command.
+The health-check command runs `SELECT 1` and prints `PostgreSQL connection successful.` on success. The app reads `DATABASE_URL`; Compose reads `POSTGRES_DB`, `POSTGRES_USER`, and `POSTGRES_PASSWORD`. Keep these values consistent. The example credentials are for local development. If using an existing PostgreSQL server, set its connection URL and skip the Docker command.
 
-SQLAlchemy uses Psycopg as the PostgreSQL driver. Use a `postgresql+psycopg://` URL; existing `postgresql://` URLs are also accepted. Load the environment before importing `src.db.database`. Its engine opens connections when needed, and `Base` is the base class for future ORM table models; `src/models.py` contains separate Pydantic API models.
+SQLAlchemy uses Psycopg as the PostgreSQL driver. Use a `postgresql+psycopg://` URL; existing `postgresql://` URLs are also accepted. Load the environment before importing `src.db.database`. Its engine opens connections when needed, and `Base` is the base class for future ORM table models; `src/schemas/models.py` contains separate Pydantic API models.
 
 Import sessions with `from src.db.database import SessionLocal` and table models with `from src.db.db_models import Tenant` from other application modules. Run module commands from the repository root. Use a fresh session for each unit of database work:
 
@@ -76,33 +77,64 @@ The context commits successful work, rolls back on exceptions, and closes the se
 
 Stop the database with `docker compose stop db`; its data remains in the named volume. PostgreSQL initialization credentials apply only when that volume is first initialized. Changing `.env` does not change an existing database's credentials.
 
-Table definitions are in `src/db/db_models.py`; importing them registers SQLAlchemy metadata without creating tables. Migrations, physical table creation, demo seed data, API routes, and Stripe integration are not implemented yet.
+Table definitions are in `src/db/db_models.py`; importing them registers SQLAlchemy metadata without creating tables. The seed command creates missing tables and inserts Free/Pro plans plus a Capstone Demo tenant, Demo User, and active Free subscription. Reruns preserve existing plans, users, signup timestamps, and subscriptions. Usage and Stripe event tables start empty. The demo name identifies the seed tenant; reserve it for demo data. Setup is transactional and serialized across simultaneous seed commands. `create_all` does not migrate or rename existing tables; schema migrations and Stripe integration are not implemented yet.
 
 ## Database definitions
 
 | Table | Responsibility |
 | --- | --- |
 | `tenants` | Organizations that own usage and a Stripe customer reference. |
-| `customers` | Individual customers linked to their tenant. |
-| `plans` | Monthly API-call and token quotas, with an optional Stripe price reference. |
+| `users` | People belonging to a tenant; billing and quotas belong to the tenant. |
+| `plans` | 30-day API-call and token quotas, with an optional Stripe price reference. |
 | `subscriptions` | One current plan/status and period per tenant; Stripe references are optional for Free tenants. |
 | `usage_events` | Accepted generations, token breakdown, exact decimal cost, currency, pricing version, and stored response for retries. |
+| `api_keys` | Hashed tenant credentials with expiry and revocation timestamps. |
 | `stripe_events` | Processed Stripe event IDs for webhook deduplication. |
 
-Each usage event counts as one API call. Total tokens are input plus output; cached and reasoning counts are subsets. An idempotency key is unique within a tenant, and a request fingerprint supports detecting changed payloads on retries. Costs use `NUMERIC(20, 12)`; rates, currency choice, and rounding policy remain to be defined. Monthly queries use the tenant's period with an inclusive start and exclusive end; the calendar-versus-subscription reset policy remains to be defined.
+Each usage event counts as one API call. Total tokens are input plus output; cached and reasoning counts are subsets. An idempotency key is unique within a tenant, and a request fingerprint supports detecting changed payloads on retries. Costs use `NUMERIC(20, 12)`; rates and currency must be configured; costs round half-up to 12 decimal places. Quota periods last exactly 30 days (720 hours), anchored to the tenant signup timestamp in UTC. The start is inclusive and the end is exclusive. January 31 resets on March 2 in a non-leap year and March 1 in a leap year. These quota periods are separate from Stripe billing dates.
 
-These definitions enforce foreign keys, uniqueness, and valid token ranges. Tenant authorization, concurrent quota enforcement, retry handling, and atomic webhook processing must still be implemented in the application.
+These definitions enforce foreign keys, uniqueness, and valid token ranges. Tenant API-key authentication, concurrent quota enforcement, and retry handling are implemented. Atomic webhook processing remains pending.
 
 ## Project structure
 
 ```text
 src/
-  models.py       API and token-usage validation models
+  core/
+    __init__.py   Shared infrastructure package
+    logging.py    Application logging configuration
+    errors.py     Shared exceptions and HTTP error handlers
+  api/
+    __init__.py   HTTP package
+    app.py        FastAPI app and lifecycle
+    routes.py     HTTP route registration and response contracts
+    controllers.py Authenticated generate/usage request handlers
+  auth/
+    __init__.py   Authentication package
+    service.py    Key issuance, authentication, expiry, and revocation
+    dependencies.py Bearer authentication for routes
+    cli.py        Local administrator key management
+  schemas/
+    __init__.py   API schema package
+    models.py     API and token-usage validation models
+  services/
+    __init__.py   Business logic package
+    metering.py   Atomic metering, retry handling, and quotas
+    usage.py      Tenant usage aggregation
+    pricing.py    Configurable server-side pricing
   db/
     __init__.py   Database package
+    periods.py    Signup-anchored 30-day quota windows
+    seed.py       Create missing tables and insert repeatable demo data
     db_models.py  SQLAlchemy table definitions and relationships
     database.py   SQLAlchemy engine, sessions, ORM base, and health check
+tests/
+  test_errors.py Shared logging and HTTP error checks
+  test_api.py     HTTP/authentication and pricing tests
+  test_metering.py PostgreSQL metering and concurrency integration tests
+  test_seed.py    First quota period with database/application clock skew
+  test_periods.py Date boundaries, leap years, and timezone checks
 compose.yaml      Local PostgreSQL service and persistent volume
+DESIGN.md         Phase 1 architecture and API contract
 .env.example      Local database configuration template
 pyproject.toml    Python dependencies
 uv.lock           Locked dependency versions
@@ -124,3 +156,62 @@ Core scope is two plans, two usage types, one simulated billable endpoint, and S
 
 | Error ID | Mistake | Resolution and lesson |
 | --- | --- | --- |
+| QUOTA-001 | Seed initialization mixed database signup time with application time, allowing a before-signup error. | Use the stored signup timestamp for the first period's anchor and lookup. Clock-skew regression and live seeding passed. |
+| DOMAIN-001 | Called people belonging to a tenant customers. | Renamed them users. The tenant is the customer organization and owns billing and quotas; verified ORM relationships and table definitions. |
+
+
+## Quota period calculation
+
+Call `subscription.set_quota_period(tenant.created_at, at)` on signup and before checking quota, within the application's transaction. The tenant signup timestamp stays fixed across resets and upgrades. The method updates the in-memory period fields; the caller must commit them. Quota enforcement calculates the current window on each billable request; no scheduler is required.
+
+Run date checks with `uv run -m unittest discover -s tests`.
+
+## Metering
+
+Import `record_usage` from `src.services.metering` and `GenerateRequest` / `TokenUsage` from `src.schemas.models`. The function takes an authenticated tenant ID, request and idempotency key, plus required keyword arguments `cost` (Decimal), `currency`, and `pricing_version` supplied by trusted server pricing logic. No pricing rates are chosen yet; do not accept these billing values from clients.
+
+The service owns its transaction, locks the tenant, checks a canonical request fingerprint, and returns the saved response for identical retries. A changed payload with the same key raises `MeteringError(409)`. Missing tenants return 404, inactive/missing subscriptions return 402, and either exhausted quota returns 429. Active and trialing subscriptions may generate. Exact quota boundaries are allowed. Each successful simulated generation adds one event; cached/reasoning subsets are not counted twice.
+
+Period lookup and event timestamps use the database clock after acquiring the lock. All future usage writers and subscription updates must take the same tenant lock. The service uses PostgreSQL's default READ COMMITTED isolation. HTTP routes authenticate the tenant and translate these exceptions into HTTP responses.
+
+Run PostgreSQL integration tests against the configured local database after seeding. Tests create uniquely named test tenants/plans and remove only their own records:
+
+```powershell
+$env:RUN_DB_TESTS = "1"
+uv run --env-file .env -m unittest discover -s tests -p test_metering.py
+```
+## Run the HTTP API
+
+```powershell
+uv run --env-file .env -m src.db.seed
+uv run --env-file .env -m src.auth.cli issue --tenant-id <tenant-id> --days 90
+uv run --env-file .env uvicorn src.api.app:app --host 127.0.0.1 --port 8000
+```
+
+Use the tenant ID from the `tenants` table. The local administrator CLI prints a newly generated key once; store it securely. Only its SHA-256 hash is stored. Keys expire after the requested lifetime (default 90 days, maximum 365). Revoke a key with `uv run --env-file .env -m src.auth.cli revoke --key-id <key-id>`. Issuance and revocation require local database access; there is no public key-issuance endpoint or password login. Use HTTPS when exposing the API beyond local development. Revocation blocks subsequent authentication; it does not cancel an already authorized request.
+
+Swagger documentation: `http://127.0.0.1:8000/docs`. Enter the raw API key in Authorize.
+
+| Route | Headers | Behavior |
+| --- | --- | --- |
+| `POST /generate` | `Authorization: Bearer <key>`, `Idempotency-Key: <unique-request-key>`, `Content-Type: application/json` | Validates simulated tokens, applies server pricing, and records usage once. |
+| `GET /usage` | `Authorization: Bearer <key>` | Current period, plan/status, used/limit counts, and costs grouped by currency. |
+
+Example generation JSON (send the body directly, without an HTTP-envelope wrapper):
+
+```json
+{"prompt":"Explain gravity","usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":50,"reasoning_tokens":10}}
+```
+
+Responses use JSON, `Cache-Control: no-store`, and `X-Content-Type-Options: nosniff`. Invalid/missing/expired/revoked keys return 401 with `WWW-Authenticate: Bearer`. Invalid bodies or missing idempotency headers return 422; inactive subscriptions return 402; conflicts return 409; quotas return 429. Unavailable database or missing pricing configuration returns 503. Errors contain `error_code` and `message`. Client-supplied tenant IDs and costs are rejected in the generation body; tenant identity comes exclusively from the key.
+
+Configure `INPUT_RATE_PER_MILLION`, `CACHED_RATE_PER_MILLION`, `OUTPUT_RATE_PER_MILLION`, `API_CALL_RATE`, `BILLING_CURRENCY`, and `PRICING_VERSION` in `.env` before generation. Blank placeholders intentionally do not define charges. These are rates you must choose, not provider prices fetched automatically. Cost = per-call rate + (uncached input × input rate + cached input × cached rate + all output × output rate) / 1,000,000. Reasoning tokens are already included in output. Costs are rounded half-up to 12 decimal places. Update the pricing version when rates change. Usage reporting works without configured rates and never adds amounts of different currencies together.
+
+Run all tests against the initialized local database with `RUN_DB_TESTS=1` and `uv run --env-file .env -m unittest discover -s tests`. Integration tests use temporary test tenants and keys, never print raw test keys, and clean up their own records. Test pricing constants are synthetic and are not production defaults. Stripe Checkout/webhook routes remain part of Phase 3.
+## Logging and errors
+
+Import `debug`, `info`, `warning`, `error`, or `critical` from `src.core.logging` and call, for example, `info(__name__, "Usage committed tenant_id=%s", tenant_id)`. `exception` additionally includes the active exception traceback and must only be used when those details are safe. Use `configure_logging("DEBUG")` to enable debug output; the default is INFO. API startup and CLI entry points call `configure_logging()` once; logs go to stderr with timestamp, level, and module name. Shared domain exceptions live in `src.core.errors`; `src.core.errors` registers their HTTP handlers. Unexpected errors produce a generic 500 response, and database failures produce 503. Logs omit API keys, credentials, prompts, request bodies, and raw database exception details. Key issuance still prints its one-time secret to command output, never to the logger. Standard validation exceptions remain in schemas and date calculations.
+
+## HTTP controller structure
+
+`src/api/routes.py` maps HTTP methods and paths to handlers in `src/api/controllers.py`. Controllers receive validated schemas and authenticated tenant context, then call pricing, metering, or usage services. Shared error handlers translate exceptions into HTTP responses. Both routes retain bearer authentication; generation also requires `Idempotency-Key`. Their request and response contracts are available at `/docs` and `/openapi.json`. This implements the HTTP layer; Phase 1's committed design-document gate is separate.

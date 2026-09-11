@@ -8,10 +8,11 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
+from .periods import quota_period
 
 
 class Tenant(Base):
-    """Organization that owns customers, a subscription, and usage."""
+    """Customer organization that owns users, a subscription, and usage."""
 
     __tablename__ = "tenants"
 
@@ -20,25 +21,25 @@ class Tenant(Base):
     stripe_customer_id: Mapped[str | None] = mapped_column(String(255), unique=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
-    customers: Mapped[list[Customer]] = relationship(back_populates="tenant")
+    users: Mapped[list[User]] = relationship(back_populates="tenant")
     subscription: Mapped[Subscription | None] = relationship(back_populates="tenant")
     usage_events: Mapped[list[UsageEvent]] = relationship(back_populates="tenant")
 
 
-class Customer(Base):
-    """A customer belonging to one tenant; distinct from a Stripe customer."""
+class User(Base):
+    """A person belonging to one tenant; the tenant is the billing customer."""
 
-    __tablename__ = "customers"
+    __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     tenant_id: Mapped[int] = mapped_column(ForeignKey("tenants.id"), index=True)
     name: Mapped[str] = mapped_column(String(255))
 
-    tenant: Mapped[Tenant] = relationship(back_populates="customers")
+    tenant: Mapped[Tenant] = relationship(back_populates="users")
 
 
 class Plan(Base):
-    """Monthly quota definitions; Free and Pro values are seeded separately."""
+    """30-day quota definitions; Free and Pro values are seeded separately."""
 
     __tablename__ = "plans"
     __table_args__ = (
@@ -56,7 +57,7 @@ class Plan(Base):
 
 
 class Subscription(Base):
-    """One current subscription per tenant, including the local Free plan."""
+    """One subscription per tenant; period fields track quota, not Stripe dates."""
 
     __tablename__ = "subscriptions"
     __table_args__ = (
@@ -73,6 +74,14 @@ class Subscription(Base):
 
     tenant: Mapped[Tenant] = relationship(back_populates="subscription")
     plan: Mapped[Plan] = relationship(back_populates="subscriptions")
+
+    def set_quota_period(self, signup_at: datetime, at: datetime | None = None) -> None:
+        """Set the current window using the tenant's original created_at timestamp.
+
+        Call on signup and before quota checks; the caller owns the transaction.
+        This updates period boundaries only and never deletes historical usage.
+        """
+        self.period_start, self.period_end = quota_period(signup_at, at)
 
 
 class UsageEvent(Base):
@@ -117,3 +126,16 @@ class StripeEvent(Base):
     id: Mapped[str] = mapped_column(String(255), primary_key=True)
     event_type: Mapped[str] = mapped_column(String(255))
     processed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class APIKey(Base):
+    """Tenant credentials; raw keys are never persisted."""
+
+    __tablename__ = "api_keys"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(ForeignKey("tenants.id"), index=True)
+    key_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

@@ -4,8 +4,21 @@ For full architectural and design guidance, see the README.md.
 
 ## key files:
 - src/db/database.py
-- src/models.py
+- src/schemas/models.py
+- src/services/metering.py
 - src/db/db_models.py
+- src/db/periods.py
+- src/db/seed.py
+- src/core/logging.py
+- src/core/errors.py
+- src/api/app.py
+- src/api/routes.py
+- src/api/controllers.py
+- src/auth/service.py
+- src/auth/dependencies.py
+- src/auth/cli.py
+- src/services/usage.py
+- src/services/pricing.py
 
 As you create or modify files, keep the **Key Files** section above up to date.
 
@@ -53,3 +66,6 @@ If a business-logic mistake is discovered, record the observed failure,
 cause if known, correction, and a repeatable regression check there.
 
 Do not log tooling, environment, formatting, or documentation issues.
+
+## 11. MVC for the API
+Follow MVC with a service layer: keep controllers/routes focused on HTTP input, authentication, calling services, and translating results/errors into responses. Keep business rules and transaction boundaries in `src/services/`, database models and persistence setup in `src/db/`, and request/response validation in `src/schemas/`. JSON responses serve as the view. Preserve the existing folder structure and avoid unnecessary abstractions.
