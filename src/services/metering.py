@@ -1,6 +1,5 @@
 import hashlib
 import json
-from decimal import Decimal
 
 from sqlalchemy import func, select
 
@@ -9,23 +8,18 @@ from src.db.db_models import Plan, Subscription, Tenant, UsageEvent
 from src.schemas.models import GenerateRequest, GenerateResponse
 from src.core.errors import MeteringError
 from src.core.logging import info
-
-
+from src.services.pricing import PricingPolicy
 
 
 def record_usage(
     tenant_id: int,
     request: GenerateRequest,
     idempotency_key: str,
-    *,
-    cost: Decimal,
-    currency: str,
-    pricing_version: str,
 ) -> GenerateResponse:
     """Meter one simulated generation and commit it atomically.
 
-    tenant_id must come from authenticated server context. Cost, currency and
-    pricing_version must come from server pricing logic, never client input.
+    tenant_id must come from authenticated server context. Server pricing is
+    loaded only for new requests, after checking for a recorded response.
     Uses PostgreSQL READ COMMITTED and owns its session/transaction. Other
     usage writers and subscription updates must acquire the same tenant lock.
     """
@@ -50,6 +44,9 @@ def record_usage(
             info(__name__, "Returning recorded response tenant_id=%s event_id=%s", tenant_id, existing.id)
             return GenerateResponse.model_validate(existing.response_body)
 
+        policy = PricingPolicy()
+        cost = policy.cost(request.usage)
+
         subscription = session.scalar(select(Subscription).where(Subscription.tenant_id == tenant_id))
         if subscription is None or subscription.status not in ("active", "trialing"):
             raise MeteringError(402, "An active subscription is required; update payment or subscription.")
@@ -71,14 +68,6 @@ def record_usage(
         if used_tokens + request.usage.input_tokens + request.usage.output_tokens > plan.token_limit:
             raise MeteringError(429, "AI-token quota exceeded; wait for the reset or upgrade your plan.")
 
-        if not isinstance(cost, Decimal) or not cost.is_finite() or cost < 0:
-            raise ValueError("Server-calculated cost must be a finite nonnegative Decimal.")
-        if cost >= Decimal("100000000") or cost != cost.quantize(Decimal("0.000000000001")):
-            raise ValueError("Cost must fit NUMERIC(20, 12) without rounding.")
-        if len(currency) != 3 or not currency.isascii() or not currency.isalpha() or not currency.isupper():
-            raise ValueError("Currency must be a three-letter uppercase code.")
-        if not pricing_version.strip() or len(pricing_version) > 100:
-            raise ValueError("Pricing version must contain 1 to 100 characters.")
         response = GenerateResponse(text=f"Simulated response: {request.prompt}", usage=request.usage, cost=cost)
         session.add(UsageEvent(
             tenant_id=tenant_id,
@@ -86,8 +75,8 @@ def record_usage(
             request_fingerprint=fingerprint,
             **request.usage.model_dump(),
             cost=cost,
-            currency=currency,
-            pricing_version=pricing_version,
+            currency=policy.currency,
+            pricing_version=policy.version,
             response_body=response.model_dump(mode="json"),
             created_at=now,
         ))

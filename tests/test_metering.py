@@ -2,7 +2,7 @@ import os
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
-from decimal import Decimal
+from unittest.mock import patch
 from threading import Barrier
 from uuid import uuid4
 
@@ -10,6 +10,10 @@ from uuid import uuid4
 @unittest.skipUnless(os.getenv("RUN_DB_TESTS") == "1", "Set RUN_DB_TESTS=1 for PostgreSQL integration tests")
 class MeteringTests(unittest.TestCase):
     def setUp(self):
+        from test_api import RATES
+        rates = patch.dict(os.environ, RATES)
+        rates.start()
+        self.addCleanup(rates.stop)
         from src.db.database import SessionLocal
         from src.db.db_models import Plan, Subscription, Tenant
         self.sessions = SessionLocal
@@ -31,6 +35,7 @@ class MeteringTests(unittest.TestCase):
             session.execute(delete(Subscription).where(Subscription.tenant_id == self.tenant_id))
             session.execute(delete(Tenant).where(Tenant.id == self.tenant_id))
             session.execute(delete(Plan).where(Plan.id == self.plan_id))
+        self.doCleanups()
 
     def record(self, key, tokens=60, tenant_id=None):
         from src.schemas.models import GenerateRequest, TokenUsage
@@ -39,7 +44,7 @@ class MeteringTests(unittest.TestCase):
             self.tenant_id if tenant_id is None else tenant_id,
             GenerateRequest(prompt="test", usage=TokenUsage(
                 input_tokens=tokens, output_tokens=40, cached_input_tokens=20, reasoning_tokens=10,
-            )), key, cost=Decimal("0.000123"), currency="USD", pricing_version="test-only",
+            )), key,
         )
 
     def test_replay_conflict_and_quota(self):

@@ -168,7 +168,7 @@ Run date checks with `uv run -m unittest discover -s tests`.
 
 ## Metering
 
-Import `record_usage` from `src.services.metering` and `GenerateRequest` / `TokenUsage` from `src.schemas.models`. The function takes an authenticated tenant ID, request and idempotency key, plus required keyword arguments `cost` (Decimal), `currency`, and `pricing_version` supplied by trusted server pricing logic. No pricing rates are chosen yet; do not accept these billing values from clients.
+Import `record_usage` from `src.services.metering` and `GenerateRequest` / `TokenUsage` from `src.schemas.models`. The function takes an authenticated tenant ID, request and idempotency key. It loads server pricing and calculates cost only after checking for a recorded response, so identical retries work even when current pricing is unavailable. New requests still require valid pricing configuration. No pricing rates are chosen yet; do not accept billing values from clients.
 
 The service owns its transaction, locks the tenant, checks a canonical request fingerprint, and returns the saved response for identical retries. A changed payload with the same key raises `MeteringError(409)`. Missing tenants return 404, inactive/missing subscriptions return 402, and either exhausted quota returns 429. Active and trialing subscriptions may generate. Exact quota boundaries are allowed. Each successful simulated generation adds one event; cached/reasoning subsets are not counted twice.
 

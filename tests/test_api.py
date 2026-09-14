@@ -85,6 +85,22 @@ class APITests(unittest.TestCase):
         denied = self.client.post("/generate", headers={**self.headers, "Idempotency-Key": "new"}, json=self.body)
         self.assertEqual(denied.status_code, 429)
 
+    def test_generation_replay_survives_missing_pricing(self):
+        from sqlalchemy import func, select
+        from src.db.db_models import UsageEvent
+        first = self.client.post("/generate", headers=self.headers, json=self.body)
+        self.assertEqual(first.status_code, 200, first.text)
+        with patch.dict(os.environ):
+            for name in RATES:
+                os.environ.pop(name, None)
+            replay = self.client.post("/generate", headers=self.headers, json=self.body)
+        with self.fixture.sessions() as session:
+            self.assertEqual(session.scalar(select(func.count(UsageEvent.id)).where(
+                UsageEvent.tenant_id == self.fixture.tenant_id,
+            )), 1)
+        self.assertEqual(replay.status_code, 200, replay.text)
+        self.assertEqual(replay.json(), first.json())
+
     def test_validation_missing_pricing_and_expiry(self):
         from datetime import timedelta
         from sqlalchemy import func, select
