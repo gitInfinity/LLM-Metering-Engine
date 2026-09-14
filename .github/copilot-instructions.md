@@ -19,6 +19,8 @@ For full architectural and design guidance, see the README.md.
 - src/auth/cli.py
 - src/services/usage.py
 - src/services/pricing.py
+- src/services/checkout.py
+- src/services/webhooks.py
 
 As you create or modify files, keep the **Key Files** section above up to date.
 

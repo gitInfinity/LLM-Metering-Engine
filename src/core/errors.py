@@ -24,6 +24,10 @@ class PricingUnavailable(Exception):
     """Server pricing cannot produce a valid charge."""
 
 
+class CheckoutUnavailable(Exception):
+    """Stripe Checkout cannot currently be created."""
+
+
 
 
 def error_response(status: int, message: str, *, headers=None, details=None) -> JSONResponse:
@@ -65,6 +69,11 @@ async def database_error(request: Request, exc: OperationalError):
     return error_response(503, "Database temporarily unavailable.")
 
 
+async def checkout_error(request: Request, exc: CheckoutUnavailable):
+    warning(__name__, "Stripe Checkout unavailable")
+    return error_response(503, str(exc))
+
+
 async def unexpected_error(request: Request, exc: Exception):
     # Exception messages/tracebacks may contain SQL parameters or credentials.
     error(__name__, "Unhandled application error type=%s", type(exc).__name__)
@@ -76,6 +85,7 @@ def register_error_handlers(app: FastAPI) -> None:
         (MeteringError, metering_error), (AuthenticationError, authentication_error),
         (HTTPException, http_error), (RequestValidationError, validation_error),
         (PricingUnavailable, pricing_error), (OperationalError, database_error),
+        (CheckoutUnavailable, checkout_error),
         (Exception, unexpected_error),
     ):
         app.add_exception_handler(error, handler)

@@ -133,3 +133,68 @@ class APITests(unittest.TestCase):
             with other.sessions.begin() as session:
                 session.execute(delete(APIKey).where(APIKey.tenant_id == other.tenant_id))
             other.tearDown()
+
+    def test_checkout_customer_reuse_and_no_upgrade(self):
+        from types import SimpleNamespace
+        from stripe import Price
+        from stripe.checkout import Session
+        from sqlalchemy import select
+        from src.db.db_models import Tenant, Subscription
+        config = {"STRIPE_SECRET_KEY": "sk_test_fixture", "STRIPE_PRO_PRICE_ID": "price_fixture",
+                  "STRIPE_CHECKOUT_SUCCESS_URL": "http://localhost:8000/docs",
+                  "STRIPE_CHECKOUT_CANCEL_URL": "http://localhost:8000/docs"}
+        with patch.dict(os.environ, config), patch("src.services.checkout.StripeClient") as factory:
+            stripe = factory.return_value.v1
+            stripe.prices.retrieve.return_value = Price.construct_from({
+                "livemode": False, "active": True, "currency": "usd", "unit_amount": 2000,
+                "billing_scheme": "per_unit",
+                "recurring": {"interval": "month", "interval_count": 1, "usage_type": "licensed"},
+            }, "sk_test_fixture")
+            stripe.customers.create.return_value = SimpleNamespace(id="cus_checkout_test")
+            stripe.subscriptions.list.return_value.auto_paging_iter.return_value = []
+            stripe.checkout.sessions.list.return_value.auto_paging_iter.return_value = []
+            saved = Session.construct_from({"url": "https://checkout.stripe.com/test_fixture",
+                                           "metadata": {"tenant_id": str(self.fixture.tenant_id), "price_id": "price_fixture"}},
+                                          "sk_test_fixture")
+            stripe.checkout.sessions.create.return_value = saved
+            self.assertEqual(self.client.post("/checkout").status_code, 401)
+            self.assertEqual(self.client.post("/checkout", headers={"Authorization": self.headers["Authorization"]}).status_code, 422)
+            first = self.client.post("/checkout", headers={**self.headers, "X-Tenant-ID": "-1"})
+            self.assertEqual(first.status_code, 200, first.text)
+            self.assertEqual(first.json(), {"checkout_url": saved.url})
+            params = stripe.checkout.sessions.create.call_args.args[0]
+            self.assertEqual(params["customer"], "cus_checkout_test")
+            self.assertEqual(params["client_reference_id"], str(self.fixture.tenant_id))
+            self.assertEqual(params["subscription_data"]["metadata"]["tenant_id"], str(self.fixture.tenant_id))
+            self.assertEqual(params["line_items"], [{"price": "price_fixture", "quantity": 1}])
+            self.assertEqual(params["mode"], "subscription")
+            stripe.checkout.sessions.list.return_value.auto_paging_iter.return_value = [saved]
+            second = self.client.post("/checkout", headers=self.headers)
+            self.assertEqual(second.status_code, 200, second.text)
+            self.assertEqual(second.json(), first.json())
+            stripe.customers.create.assert_called_once()
+            stripe.checkout.sessions.create.assert_called_once()
+            with self.fixture.sessions() as session:
+                self.assertEqual(session.get(Tenant, self.fixture.tenant_id).stripe_customer_id, "cus_checkout_test")
+                subscription = session.scalar(select(Subscription).where(Subscription.tenant_id == self.fixture.tenant_id))
+                self.assertEqual(subscription.plan_id, self.fixture.plan_id)
+                self.assertIsNone(subscription.stripe_subscription_id)
+            stripe.subscriptions.list.return_value.auto_paging_iter.return_value = [SimpleNamespace(status="active")]
+            self.assertEqual(self.client.post("/checkout", headers=self.headers).status_code, 409)
+
+    def test_checkout_invalid_config_price_and_stripe_failure(self):
+        from stripe import APIConnectionError, Price
+        config = {"STRIPE_SECRET_KEY": "sk_test_fixture", "STRIPE_PRO_PRICE_ID": "price_fixture",
+                  "STRIPE_CHECKOUT_SUCCESS_URL": "http://localhost:8000/docs",
+                  "STRIPE_CHECKOUT_CANCEL_URL": "http://localhost:8000/docs"}
+        with patch.dict(os.environ, config), patch("src.services.checkout.StripeClient") as factory:
+            with patch.dict(os.environ, {"STRIPE_SECRET_KEY": "sk_live_fixture"}):
+                self.assertEqual(self.client.post("/checkout", headers=self.headers).status_code, 503)
+            factory.assert_not_called()
+            factory.return_value.v1.prices.retrieve.return_value = Price.construct_from({"livemode": True}, "sk_test_fixture")
+            self.assertEqual(self.client.post("/checkout", headers=self.headers).status_code, 503)
+            factory.return_value.v1.customers.create.assert_not_called()
+            factory.return_value.v1.prices.retrieve.side_effect = APIConnectionError("sensitive provider details")
+            response = self.client.post("/checkout", headers=self.headers)
+            self.assertEqual(response.status_code, 503)
+            self.assertNotIn("sensitive", response.text)

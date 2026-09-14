@@ -36,4 +36,6 @@ Input includes cached tokens; output includes reasoning tokens. Total quota toke
 
 ## Later phases and validation
 
+The approved Pro subscription is a flat $20 USD per calendar month in Stripe test mode (2000 cents, recurring monthly). Recorded usage costs do not create additional Stripe charges. Quota periods remain exactly 30 days from signup, independent of monthly billing.
+
 Stripe test Checkout and signed, deduplicated subscription webhooks are Phase 3 work. Final pinned pricing and complete evidence are Phase 4 work. No real model call, overage billing, proration, or invoicing is required. Current tests cover date boundaries, clock skew, retries, concurrency, quotas, authentication, tenant isolation, pricing arithmetic, and error handling. See README for setup and test commands.

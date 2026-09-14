@@ -43,6 +43,10 @@ class GenerateResponse(BaseModel):
     cost: Decimal = Field(ge=0, allow_inf_nan=False)
 
 
+class CheckoutResponse(BaseModel):
+    checkout_url: str
+
+
 class UsageResponse(BaseModel):
     period_start: datetime
     period_end: datetime
