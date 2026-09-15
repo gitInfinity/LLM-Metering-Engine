@@ -2,7 +2,7 @@
 
 A backend capstone project that tracks API calls and AI token usage per tenant, calculates per-request and 30-day costs, enforces quotas, and supports subscription upgrades through Stripe test mode.
 
-**Status:** PostgreSQL setup, metering, bearer API-key authentication, generation/usage routes, and Stripe test Checkout are implemented. Signed webhook synchronization and the sandbox Pro upgrade are verified. Final usage-pricing decisions and submission evidence remain pending.
+**Status:** PostgreSQL setup, metering, bearer API-key authentication, generation/usage routes, and Stripe test Checkout are implemented. Signed webhook synchronization and the sandbox Pro upgrade are verified. Phase 4 implementation and project-local submission artifacts are complete: `demo-v1` pricing, cost evidence, build log, and run manifest. See [EVIDENCE.md](EVIDENCE.md) for 32 passing tests and verification limits. The manifest includes the assignment's required fields; execution by the external evaluator has not been tested.
 
 ## Scope
 
@@ -20,9 +20,24 @@ A backend capstone project that tracks API calls and AI token usage per tenant, 
 | Free | 1,000 | 100,000 |
 | Pro | 10,000 | 1,000,000 |
 
-Pricing rates will be pinned in configuration. Cached input tokens use a cheaper rate, and reasoning tokens count as output tokens. Cost calculations must avoid double-counting overlapping token categories. Exact totals will be verified in `EVIDENCE.md`.
+Synthetic capstone demo rates are pinned in configuration as `demo-v1` (USD). Cached input tokens use a cheaper rate, and reasoning tokens count as output tokens. Cost calculations must avoid double-counting overlapping token categories. Exact totals are verified in [EVIDENCE.md](EVIDENCE.md).
 
 Pro subscription pricing is $20 USD per calendar month in Stripe test mode. This flat subscription price is separate from the recorded token/API-call costs; the current scope does not bill additional usage charges. Quotas remain signup-anchored 30-day periods.
+
+## Demo usage pricing
+
+`demo-v1` uses USD and the following fixed capstone rates:
+
+| Charge | Rate |
+| --- | ---: |
+| Uncached input | $2 per million tokens |
+| Cached input | $0.50 per million tokens |
+| Output (including reasoning) | $8 per million tokens |
+| Each accepted API call | $0.001 |
+
+These rates record usage costs separately from the $20/month Stripe subscription and do not generate additional Stripe charges. Cached tokens are a subset of input; reasoning tokens are a subset of output. For 100 input tokens (20 cached) and 50 output tokens (10 reasoning), the cost is `0.001 + (80 * 2 + 20 * 0.5 + 50 * 8) / 1000000 = 0.001570000000 USD`.
+
+New events store `demo-v1` as their pricing version. Identical retries retain their original saved cost and version; changing configuration does not reprice history. Restart the API after changing `.env`.
 
 ## Phase 3: Stripe test setup
 
@@ -64,7 +79,7 @@ Client -> Stripe Checkout (test mode)
 Stripe -> Signed webhook -> Verify + deduplicate -> Sync subscription
 ```
 
-The database will contain tenants, plans, subscriptions, and usage events. Stripe is the source of truth for payment state; verified webhook events update the local subscription records.
+The database contains tenants, users, plans, subscriptions, usage events, API keys, and processed Stripe events. Stripe is the source of truth for payment state; verified webhook events update the local subscription records.
 
 ## Build phases
 
@@ -80,8 +95,8 @@ The database will contain tenants, plans, subscriptions, and usage events. Strip
 Requires Python 3.12+, uv, and Docker Desktop running Linux containers. From the repository root, create your local configuration once:
 
 ```powershell
-Copy-Item .env.example .env
-uv sync
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
+uv sync --locked
 . .\.venv\Scripts\Activate.ps1
 docker compose up -d --wait db
 uv run --env-file .env -m src.db.database
@@ -136,7 +151,7 @@ src/
     __init__.py   HTTP package
     app.py        FastAPI app and lifecycle
     routes.py     HTTP route registration and response contracts
-    controllers.py Authenticated generate/usage request handlers
+    controllers.py Generation, usage, Checkout, and raw webhook HTTP handlers
   auth/
     __init__.py   Authentication package
     service.py    Key issuance, authentication, expiry, and revocation
@@ -167,6 +182,9 @@ tests/
   test_periods.py Date boundaries, leap years, and timezone checks
 compose.yaml      Local PostgreSQL service and persistent volume
 DESIGN.md         Phase 1 architecture and API contract
+EVIDENCE.md       Executed checks, exact costs, and historical sandbox verification
+BUILDLOG.md       AI-assisted work, corrections, and phase history
+capstone.yaml     Project-local run/seed/test commands and endpoint inventory
 .env.example      Local database configuration template
 pyproject.toml    Python dependencies
 uv.lock           Locked dependency versions
@@ -180,6 +198,8 @@ uv.lock           Locked dependency versions
 - `BUILDLOG.md`: where AI helped, where it was wrong, and what was changed.
 - `.env.example`: required environment variables with safe placeholders. Secrets must stay out of Git.
 
+The manifest uses a project-local YAML layout; its `test` command uses PowerShell syntax. The user supplied the required manifest fields: run, seed, optional test, base_url, and endpoints. No example of the nested endpoint format was supplied. PostgreSQL runs in Compose; the application runs with uv and has no application Dockerfile.
+
 ## Limitations
 
 Core scope is two plans, two usage types, one simulated billable endpoint, and Stripe test payments. Real model calls, invoicing, proration, overage billing, usage alerts, and reconciliation are outside the core scope.
@@ -188,6 +208,8 @@ Core scope is two plans, two usage types, one simulated billable endpoint, and S
 
 | Error ID | Mistake | Resolution and lesson |
 | --- | --- | --- |
+| RETRY-001 | Pricing loaded before retry lookup, blocking recorded responses. | Perform idempotency lookup before current pricing; regression passes. |
+| CHECKOUT-001 | Dictionary mocks hid incompatible Stripe SDK object access. | Convert with `to_dict()` and test actual SDK response objects. |
 | QUOTA-001 | Seed initialization mixed database signup time with application time, allowing a before-signup error. | Use the stored signup timestamp for the first period's anchor and lookup. Clock-skew regression and live seeding passed. |
 | DOMAIN-001 | Called people belonging to a tenant customers. | Renamed them users. The tenant is the customer organization and owns billing and quotas; verified ORM relationships and table definitions. |
 
@@ -200,7 +222,7 @@ Run date checks with `uv run -m unittest discover -s tests`.
 
 ## Metering
 
-Import `record_usage` from `src.services.metering` and `GenerateRequest` / `TokenUsage` from `src.schemas.models`. The function takes an authenticated tenant ID, request and idempotency key. It loads server pricing and calculates cost only after checking for a recorded response, so identical retries work even when current pricing is unavailable. New requests still require valid pricing configuration. No pricing rates are chosen yet; do not accept billing values from clients.
+Import `record_usage` from `src.services.metering` and `GenerateRequest` / `TokenUsage` from `src.schemas.models`. The function takes an authenticated tenant ID, request and idempotency key. It loads server pricing and calculates cost only after checking for a recorded response, so identical retries work even when current pricing is unavailable. New requests still require valid pricing configuration. The approved demo rates are supplied by server configuration; do not accept billing values from clients.
 
 The service owns its transaction, locks the tenant, checks a canonical request fingerprint, and returns the saved response for identical retries. A changed payload with the same key raises `MeteringError(409)`. Missing tenants return 404, inactive/missing subscriptions return 402, and either exhausted quota returns 429. Active and trialing subscriptions may generate. Exact quota boundaries are allowed. Each successful simulated generation adds one event; cached/reasoning subsets are not counted twice.
 
@@ -228,6 +250,8 @@ Swagger documentation: `http://127.0.0.1:8000/docs`. Enter the raw API key in Au
 | --- | --- | --- |
 | `POST /generate` | `Authorization: Bearer <key>`, `Idempotency-Key: <unique-request-key>`, `Content-Type: application/json` | Validates simulated tokens, applies server pricing, and records usage once. |
 | `GET /usage` | `Authorization: Bearer <key>` | Current period, plan/status, used/limit counts, and costs grouped by currency. |
+| `POST /checkout` | Bearer key and `Idempotency-Key` | Return a Stripe test Checkout URL; no body needed. |
+| `POST /stripe/webhook` | `Stripe-Signature` | Verify raw Stripe delivery and synchronize subscription state. |
 
 Example generation JSON (send the body directly, without an HTTP-envelope wrapper):
 
@@ -237,16 +261,16 @@ Example generation JSON (send the body directly, without an HTTP-envelope wrappe
 
 Responses use JSON, `Cache-Control: no-store`, and `X-Content-Type-Options: nosniff`. Invalid/missing/expired/revoked keys return 401 with `WWW-Authenticate: Bearer`. Invalid bodies or missing idempotency headers return 422; inactive subscriptions return 402; conflicts return 409; quotas return 429. Unavailable database or missing pricing configuration returns 503. Errors contain `error_code` and `message`. Client-supplied tenant IDs and costs are rejected in the generation body; tenant identity comes exclusively from the key.
 
-Configure `INPUT_RATE_PER_MILLION`, `CACHED_RATE_PER_MILLION`, `OUTPUT_RATE_PER_MILLION`, `API_CALL_RATE`, `BILLING_CURRENCY`, and `PRICING_VERSION` in `.env` before generation. Blank placeholders intentionally do not define charges. These are rates you must choose, not provider prices fetched automatically. Cost = per-call rate + (uncached input × input rate + cached input × cached rate + all output × output rate) / 1,000,000. Reasoning tokens are already included in output. Costs are rounded half-up to 12 decimal places. Update the pricing version when rates change. Usage reporting works without configured rates and never adds amounts of different currencies together.
+Configure `INPUT_RATE_PER_MILLION`, `CACHED_RATE_PER_MILLION`, `OUTPUT_RATE_PER_MILLION`, `API_CALL_RATE`, `BILLING_CURRENCY`, and `PRICING_VERSION` in `.env` before generation. The approved `demo-v1` values are included in `.env.example`; copy them into existing local configuration if needed. These are synthetic demo rates, not provider prices fetched automatically. Missing or invalid settings still return 503 for new generations. Cost = per-call rate + (uncached input × input rate + cached input × cached rate + all output × output rate) / 1,000,000. Reasoning tokens are already included in output. Costs are rounded half-up to 12 decimal places. Update the pricing version when rates change. Usage reporting works without configured rates and never adds amounts of different currencies together.
 
-Run all tests against the initialized local database with `RUN_DB_TESTS=1` and `uv run --env-file .env -m unittest discover -s tests`. Integration tests use temporary test tenants and keys, never print raw test keys, and clean up their own records. Test pricing constants are synthetic and are not production defaults. Webhook tests use real signed payloads and Stripe SDK objects with mocked network calls; sandbox delivery was separately verified on 2026-09-14.
+Run all tests against the initialized local database with `RUN_DB_TESTS=1` and `uv run --env-file .env -m unittest discover -s tests`. Integration tests use temporary test tenants and keys, never print raw test keys, and clean up their own records. Test pricing constants are synthetic; `demo-v1` is the approved demo configuration, not production provider pricing. Webhook tests use real signed payloads and Stripe SDK objects with mocked network calls; sandbox delivery was separately verified on 2026-09-14.
 ## Logging and errors
 
 Import `debug`, `info`, `warning`, `error`, or `critical` from `src.core.logging` and call, for example, `info(__name__, "Usage committed tenant_id=%s", tenant_id)`. `exception` additionally includes the active exception traceback and must only be used when those details are safe. Use `configure_logging("DEBUG")` to enable debug output; the default is INFO. API startup and CLI entry points call `configure_logging()` once; logs go to stderr with timestamp, level, and module name. Shared domain exceptions live in `src.core.errors`; `src.core.errors` registers their HTTP handlers. Unexpected errors produce a generic 500 response, and database failures produce 503. Logs omit API keys, credentials, prompts, request bodies, and raw database exception details. Key issuance still prints its one-time secret to command output, never to the logger. Standard validation exceptions remain in schemas and date calculations.
 
 ## HTTP controller structure
 
-`src/api/routes.py` maps HTTP methods and paths to handlers in `src/api/controllers.py`. Controllers receive validated schemas and authenticated tenant context, then call pricing, metering, or usage services. Shared error handlers translate exceptions into HTTP responses. Both routes retain bearer authentication; generation also requires `Idempotency-Key`. Their request and response contracts are available at `/docs` and `/openapi.json`. This implements the HTTP layer; Phase 1's committed design-document gate is separate.
+`src/api/routes.py` maps HTTP methods and paths to handlers in `src/api/controllers.py`. Controllers receive validated schemas and authenticated tenant context, then call pricing, metering, or usage services. Shared error handlers translate exceptions into HTTP responses. Generation, usage, and Checkout require bearer authentication; generation and Checkout also require `Idempotency-Key`. Webhooks instead authenticate the raw payload with `Stripe-Signature`. Their request and response contracts are available at `/docs` and `/openapi.json`. This implements the HTTP layer; Phase 1's committed design-document gate is separate.
 
 ## Local Stripe webhook testing
 

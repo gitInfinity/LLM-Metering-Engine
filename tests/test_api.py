@@ -12,6 +12,14 @@ RATES = {
 
 
 class PricingTests(unittest.TestCase):
+    def test_round_half_up_at_storage_precision(self):
+        from src.schemas.models import TokenUsage
+        from src.services.pricing import PricingPolicy
+        with patch.dict(os.environ, {**RATES, "INPUT_RATE_PER_MILLION": "0.0000005",
+                                    "CACHED_RATE_PER_MILLION": "0", "API_CALL_RATE": "0"}):
+            self.assertEqual(PricingPolicy().cost(TokenUsage(input_tokens=1, output_tokens=0)),
+                             Decimal("0.000000000001"))
+
     def test_cached_and_reasoning_are_not_double_counted(self):
         from src.schemas.models import TokenUsage
         from src.services.pricing import PricingPolicy
@@ -57,6 +65,39 @@ class APITests(unittest.TestCase):
             self.assertNotEqual(session.get(APIKey, self.key_id).key_hash, self.token)
         AuthService.revoke_key(self.key_id)
         self.assertEqual(self.client.get("/usage", headers=self.headers).status_code, 401)
+
+    def test_demo_cost_rollup_and_historical_pricing(self):
+        from dotenv import dotenv_values
+        from sqlalchemy import select
+        from src.db.db_models import Plan, UsageEvent
+        keys = tuple(RATES)
+        config = {key: dotenv_values(".env.example")[key] for key in keys}
+        self.assertEqual(config["PRICING_VERSION"], "demo-v1")
+        with self.fixture.sessions.begin() as session:
+            plan = session.get(Plan, self.fixture.plan_id)
+            plan.api_call_limit, plan.token_limit = 10, 1000
+        body = {"prompt": "cost evidence", "usage": {"input_tokens": 100, "cached_input_tokens": 20,
+                                                     "output_tokens": 50, "reasoning_tokens": 10}}
+        with patch.dict(os.environ, config):
+            first = self.client.post("/generate", headers=self.headers, json=body)
+            self.assertEqual(first.status_code, 200, first.text)
+            self.assertEqual(Decimal(first.json()["cost"]), Decimal("0.001570000000"))
+            second = self.client.post("/generate", headers={**self.headers, "Idempotency-Key": "second"},
+                                      json={"prompt": "second", "usage": {"input_tokens": 100, "cached_input_tokens": 50,
+                                                                         "output_tokens": 20, "reasoning_tokens": 10}})
+            self.assertEqual(second.status_code, 200, second.text)
+            self.assertEqual(Decimal(second.json()["cost"]), Decimal("0.001285000000"))
+            with patch.dict(os.environ, {"INPUT_RATE_PER_MILLION": "3", "PRICING_VERSION": "changed"}):
+                replay = self.client.post("/generate", headers=self.headers, json=body)
+                self.assertEqual(replay.status_code, 200, replay.text)
+                self.assertEqual(replay.json(), first.json())
+            usage = self.client.get("/usage", headers=self.headers).json()
+            self.assertEqual((usage["api_calls_used"], usage["tokens_used"]), (2, 270))
+            self.assertEqual(Decimal(usage["costs_by_currency"]["USD"]), Decimal("0.002855000000"))
+            with self.fixture.sessions() as session:
+                events = session.scalars(select(UsageEvent).where(UsageEvent.tenant_id == self.fixture.tenant_id)).all()
+                self.assertEqual(len(events), 2)
+                self.assertEqual({event.pricing_version for event in events}, {"demo-v1"})
 
     def test_inactive_subscription_cannot_generate_but_can_read_usage(self):
         from sqlalchemy import select
